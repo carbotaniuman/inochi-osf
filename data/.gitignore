@@ -1,0 +1,2 @@
+# don't leak myself: these are hardcoded arrays for comparison testing
+*.json

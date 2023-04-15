@@ -1,0 +1,25 @@
+.dub
+docs.json
+__dummy.html
+docs/
+/inochi-osf
+inochi-osf.so
+inochi-osf.dylib
+inochi-osf.pdb
+inochi-osf.dll
+inochi-osf.a
+inochi-osf.lib
+inochi-osf-test-*
+inochi-osf
+*.exe
+*.o
+*.obj
+*.lst
+
+# don't leak myself
+*.jpg
+
+# testing
+glfw3.dll
+onnxruntime.dll
+onnxruntime_providers_shared.dll

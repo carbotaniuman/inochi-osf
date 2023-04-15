@@ -1,0 +1,24 @@
+{
+	"fileVersion": 1,
+	"versions": {
+		"bcaa": "0.0.8",
+		"bindbc-glfw": "1.0.2",
+		"bindbc-loader": "1.0.3",
+		"bindbc-onnxruntime": "1.2.0",
+		"bindbc-opengl": "1.0.5",
+		"dcv": "0.3.0",
+		"dplug": "13.4.9",
+		"dvector": "0.0.5",
+		"fghj": "1.0.1",
+		"gamut": "1.0.0",
+		"glfw-d": "1.1.0",
+		"imageformats": "7.0.2",
+		"intel-intrinsics": "1.11.2",
+		"mir-algorithm": "3.20.1",
+		"mir-core": "1.5.3",
+		"mir-linux-kernel": "1.2.1",
+		"mir-random": "2.2.19",
+		"silly": "1.1.1",
+		"utf8proc": "0.0.2"
+	}
+}
