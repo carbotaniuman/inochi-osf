@@ -1,4 +1,4 @@
-import face;
+import faceinfo;
 import tracker;
 import retinaface;
 

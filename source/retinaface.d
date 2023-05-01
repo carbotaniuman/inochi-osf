@@ -19,7 +19,7 @@ import mir.ndslice.topology;
 import dcv.core;
 import dcv.imgproc;
 
-import face;
+import faceinfo : FaceData;
 import ortdata;
 
 import fghj;

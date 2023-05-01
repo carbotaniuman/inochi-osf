@@ -1,8 +1,10 @@
-import std.algorithm : any, clamp, fold, max, maxElement, min, minElement;
-import std.array : array, staticArray;
+module tracker;
+
+import std.algorithm : any, canFind, clamp, cmp, fold, max, maxElement, min, minIndex, minElement, sort;
+import std.array : array, staticArray, replicate;
 import std.conv : to;
 import std.math : atan2, cos, isNaN, pow, sin, sqrt, trunc, PI;
-import std.range : front;
+import std.range : front, popFront;
 import std.stdio;
 import std.string : toStringz;
 import std.typecons : tuple, Tuple;
@@ -18,7 +20,7 @@ import dcv.core;
 import dcv.imgproc;
 import dcv.imageio : imwrite;
 
-import face;
+import faceinfo;
 import retinaface;
 import ortdata;
 
@@ -107,6 +109,13 @@ enum ModelKind {
     N4 = 4,
 }
 
+struct ResultData {
+    float conf = -1;
+    Slice!(float*, 2, Contiguous) lms = slice!float(0, 0);
+    EyeState[] eyeState = [];
+    float bonus = 0;
+}
+
 import std.traits : EnumMembers;
 
 // for some reason static initialization doesn't work... weird
@@ -156,15 +165,17 @@ struct TrackerSettings {
     bool debugGaze = false;
 }
 
-alias Point = Tuple!(
-    float, "x", float, "y"
-);
-
 struct BoundingBox {
     Point point;
     float width;
     float height;
-};
+}
+
+struct EyeState {
+    bool open;
+    Point p;
+    float conf;
+}
 
 class Tracker {
 private:
@@ -194,6 +205,7 @@ private:
 
     TrackerSettings settings;
 
+    FaceInfo[] faceInfos = [];
     FaceData[] faces = [];
 public:
     this(size_t width, size_t height, TrackerSettings settings = TrackerSettings()) {
@@ -276,6 +288,10 @@ public:
             this.logitFactor = 16;
             this.meanRes = mean.repeat(112, 112).fuse;
             this.stdRes = std.repeat(112, 112).fuse;
+        }
+
+        foreach (i; 0..settings.maxFaces) {
+            this.faceInfos ~= new FaceInfo(this, this.settings.kind);
         }
     }
 
@@ -473,8 +489,8 @@ public:
         auto tX = (res * (maxInds / this.out_res_i) / adjustedOutRes + logitX) * cropInfo.scaleY + cropInfo.y1;
         auto tY = (res * (maxInds % this.out_res_i) / adjustedOutRes + logitY) * cropInfo.scaleX + cropInfo.x1;
 
-        import mir.math.sum : sum;
-        float avgConf = sum(tConf) / tConf.length;
+        import mir.math.stat : mean;
+        float avgConf = mean(tConf);
 
         auto lms = [tX.slice, tY.slice, tConf.slice].fuse!1;
         foreach (i; lms.byDim!0) {
@@ -608,11 +624,6 @@ public:
 
         auto groups = groupRects(actualFaces);
 
-        struct ResultData {
-            float conf = -1;
-            Slice!(float*, 2, Contiguous) lms = slice!float(0, 0);
-            float bonus = 0;
-        }
         ResultData[int] bestResults;
 
         foreach (crop; goodCrops) {
@@ -621,28 +632,103 @@ public:
                 continue;
             }
 
-            auto groupId = groups[data.bb];
-            writeln(groupId);
+            int groupId = groups[data.bb];
 
-            auto value = groupId in bestResults;
-            if (value is null) {
-                bestResults[groupId] = ResultData();
-            }
-            writeln(groupId in bestResults);
-            writeln(bestResults[groupId]);
+            bestResults.require(groupId);
             
-            writeln(groupId);
-            if (bestResults[groupId].conf < value.conf + crop.bonus) {
-                writeln(bestResults[groupId]);
-                bestResults[groupId] = ResultData(value.conf + crop.bonus, value.lms, crop.bonus);
-                writeln(groupId);
+            if (bestResults[groupId].conf < data.conf + crop.bonus) {
+                bestResults[groupId] = ResultData(data.conf + crop.bonus, data.lms, data.eyeState, crop.bonus);
             }
-            writeln(groupId);
         }
 
         auto sortedResults = bestResults.byValue.array;
-        writeln(sortedResults);
+        sortedResults.sort!("a.conf > b.conf");
+        assignFaceInfo(sortedResults[0..min($, this.settings.maxFaces)]);
+
+        foreach(faceInfo; this.faceInfos) {
+            if (faceInfo.alive && faceInfo.conf > this.settings.threshold) {
+                this.estimateDepth(faceInfo);
+            }
+        }
+
+
         return [];
+    }
+
+    void estimateDepth(FaceInfo info) {
+        auto lms = concatenation(
+            info.lms,
+            [[info.eyeState[0].p.x, info.eyeState[0].p.y, info.eyeState[0].conf],
+             [info.eyeState[1].p.x, info.eyeState[1].p.y, info.eyeState[1].conf]].sliced.fuse, 
+        ).slice;
+
+        auto imagePts = lms[info.contourPoints, 0..2];
+        writeln(imagePts);
+    }
+
+    void assignFaceInfo(ResultData[] results) {
+        import mir.math.stat : mean;
+        if (this.settings.maxFaces == 1 && results.length == 1) {
+            auto rawCoords = results[0].lms[0..$, 0..2].alongDim!0.map!mean.fuse;
+            this.faceInfos[0].update(this.frameCount, results[0], Point(rawCoords[0], rawCoords[1]));
+            return;
+        }
+
+        Point[] resultCoords = [];
+        Tuple!(float, Slice!(float*, 2, Contiguous), EyeState[])[] adjustedResults = [];
+        
+        foreach (result; results) {
+            auto temp = result.lms[0..$, 0..2].alongDim!0.map!mean.fuse;
+            resultCoords ~= Point(temp[0], temp[1]);
+            adjustedResults ~= tuple(result.conf - result.bonus, result.lms, result.eyeState);
+        }
+
+        auto maxDist = 2 * norm(this.width, this.height);
+        auto candidates = new Tuple!(float, size_t, size_t)[][this.settings.maxFaces];
+        foreach (i, faceInfo; this.faceInfos) {
+            foreach (j, coord; resultCoords) {
+                if (faceInfo.coord == Point(float.nan, float.nan)) {
+                    candidates[i] ~= tuple(maxDist, i, j);
+                } else {
+                    auto c = faceInfo.coord - coord;
+                    candidates[i] ~= tuple(norm(c.x, c.y), i, j);
+                }
+            }
+        }
+
+        auto found = 0;
+        auto target = results.length;
+
+        bool[size_t] usedFaces;
+        bool[size_t] usedResults;
+
+        while (found < target) {
+            auto minList = candidates[candidates.minIndex!"cmp(a, b)"];
+            auto candidate = minList.front;
+            minList.popFront;
+
+            auto faceIdx = candidate[1];
+            auto resultIdx = candidate[2];
+
+            if (faceIdx !in usedFaces && resultIdx !in usedResults) {
+                auto rawCoords = results[resultIdx].lms[0..$, 0..2].alongDim!0.map!mean.fuse;
+                this.faceInfos[faceIdx].update(this.frameCount, results[resultIdx], Point(rawCoords[0], rawCoords[1]));
+                minList.length = 0;
+
+                usedFaces[faceIdx] = true;
+                usedResults[resultIdx] = true;
+            }
+
+            if (minList.length == 0) {
+                minList ~= tuple(2 * maxDist, faceIdx, resultIdx);
+            }
+        }
+
+        foreach (faceInfo; this.faceInfos) {
+            if (faceInfo.frameCount != this.frameCount) {
+                faceInfo.update(this.frameCount);
+            }
+        }
     }
 
     struct EyeCornerData {
@@ -779,12 +865,6 @@ public:
         auto secondOutput = sliced(ptr, [2, 2, 1, 1]).dup;
 
         return tuple(firstOutput, secondOutput);
-    }
-
-    struct EyeState {
-        bool open;
-        Point p;
-        float conf;
     }
 
     EyeState[] getEyeState(Image frame, Slice!(float*, 2, Contiguous) lms) {
