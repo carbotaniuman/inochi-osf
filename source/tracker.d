@@ -4,7 +4,7 @@ import std.algorithm : any, canFind, clamp, cmp, fold, max, maxElement, min, min
 import std.array : array, staticArray, replicate;
 import std.conv : to;
 import std.math : atan2, cos, isNaN, pow, sin, sqrt, trunc, PI;
-import std.range : front, popFront;
+import std.range : enumerate, front, popFront;
 import std.stdio;
 import std.string : toStringz;
 import std.typecons : tuple, Tuple;
@@ -23,6 +23,11 @@ import dcv.imageio : imwrite;
 import faceinfo;
 import retinaface;
 import ortdata;
+
+import kaleidic.lubeck : inv, mtimes;
+import inmath : quat, vec3;
+
+import solvepnp : solvePnpIterative;
 
 static immutable float[][] facePnp = [
     [ 0.4551769692672  ,  0.300895790030204, -0.764429433974752],
@@ -662,8 +667,144 @@ public:
              [info.eyeState[1].p.x, info.eyeState[1].p.y, info.eyeState[1].conf]].sliced.fuse, 
         ).slice;
 
-        auto imagePts = lms[info.contourPoints, 0..2];
-        writeln(imagePts);
+        auto imagePts = lms[info.contourPoints, 0..2].slice;
+
+        auto camera = [[this.width, 0f, this.width / 2f], [0f, this.width, this.height / 2f], [0f, 0f, 1f]].fuse;
+        auto invCamera = camera.inv;
+    
+        try {
+            if (info.rotation) {
+                auto a = solvePnpIterative(info.contour, imagePts, camera, slice!float(0),
+                    info.rotation.toAxisAngle.vector.sliced, info.translation.vector.sliced);
+
+                vec3 rot = vec3(a.rvec[0], a.rvec[1], a.rvec[2]);
+                info.rotation = new quat();
+                *info.rotation = quat.axisRotation(rot.length, rot.normalized);
+                info.translation = new vec3(a.tvec[0], a.tvec[1], a.tvec[2]);
+            } else {
+                auto rvec = [0f, 0f, 0f].sliced;
+                auto tvec = [0f, 0f, 0f].sliced;
+                auto a = solvePnpIterative(info.contour, imagePts, camera, slice!float(0), rvec, tvec);
+
+                vec3 rot = vec3(a.rvec[0], a.rvec[1], a.rvec[2]);
+                info.rotation = new quat();
+                *info.rotation = quat.axisRotation(rot.length, rot.normalized);
+                info.translation = new vec3(a.tvec[0], a.tvec[1], a.tvec[2]);
+            }
+        } catch (Exception e) {
+            // Do something here
+        }
+
+        auto points3d = slice!float([70, 3], 0);
+
+        auto rmat = info.rotation.toMatrix!(3, 3);
+        auto invRmat = rmat.inverse;
+
+        auto rmatSlice = sliced(rmat.ptr, 3, 3);
+        auto invRmatSlice = sliced(invRmat.ptr, 3, 3);
+        auto tRef = mtimes(info.face3d, rmatSlice.transposed);
+        auto translationSlice = info.translation.vector.sliced;
+        
+        tRef[] += translationSlice;
+        tRef = mtimes(tRef, camera.transposed);
+
+
+        auto tDepth = tRef[0..$, 2];
+        tDepth.indexed(tDepth.filterIndices!"a == 0".array)[] = 0.000001;
+
+        // This is a matrix [70, 3] / [70, 1] which just doesn't work at all
+        // in ndslice so I have to repeat it in place and that causes an allocation
+        // but oh well.
+        auto tDepthM = tDepth.map!"[a, a, a]".fuse;
+        tRef[] /= tDepthM[];
+
+        auto concatted = concatenation!1(lms[0..66, 0].unsqueeze!1, lms[0..66, 1].unsqueeze!1, repeat(1, 66).unsqueeze!1);
+
+        points3d[0..66, 0..$] = concatted[];
+        points3d[0..66, 0..$] *= tDepthM[0..66];
+
+        auto dotted = mtimes(points3d[0..66, 0..$], invCamera.transposed);
+        dotted[0..$, 0..$] -= translationSlice;
+        
+        points3d[0..66, 0..$] = mtimes(dotted, invRmatSlice.transposed);
+
+        auto pnpError = 0.0f;
+
+        import mir.math.sum : sum;
+        {
+            auto errorCalc = lms[0..17, 0..2].dup;
+            errorCalc[] -= tRef[0..17, 0..2];
+            pnpError += errorCalc.map!"pow(a, 2)".sum;
+        }
+        
+        {
+            auto errorCalc = lms[30, 0..2].dup;
+            errorCalc[] -= tRef[30, 0..2];
+            pnpError += errorCalc.map!"pow(a, 2)".sum;
+        }
+
+        if (pnpError.isNaN) {
+            pnpError = 9_999_999.0f;
+        }
+
+        foreach (i, _; info.face3d[66..70].enumerate) {
+            // Right eyeball
+            if (i == 2) {
+                auto eyeCenter = (points3d[36] + points3d[39]) / 2.0;
+                auto subbed = points3d[36] - points3d[39];
+                auto dCorner = norm(subbed[0], subbed[1]);
+                auto depth = 0.385 * dCorner;
+                auto point3d = [eyeCenter[0], eyeCenter[1], eyeCenter[2] - depth];
+                points3d[68][] = point3d;
+                continue;
+            }
+
+            // Left eyeball
+            if (i == 3) {
+                auto eyeCenter = (points3d[42] + points3d[45]) / 2.0;
+                auto subbed = points3d[42] - points3d[45];
+                auto dCorner = norm(subbed[0], subbed[1]);
+                auto depth = 0.385 * dCorner;
+                auto point3d = [eyeCenter[0], eyeCenter[1], eyeCenter[2] - depth];
+                points3d[69][] = point3d;
+                continue;
+            }
+
+            auto pt = slice!float(3);
+            if (i == 0) {
+                auto subbed1 = lms[66] - lms[36];
+                auto d1 = norm(subbed1[0], subbed1[1]);
+                auto subbed2 = lms[66] - lms[39];
+                auto d2 = norm(subbed2[0], subbed2[1]);
+
+                auto d = d1 + d2;
+                pt[] = (points3d[36] * d1 + points3d[39] * d2) / d;
+            }
+            if (i == 1) {
+                auto subbed1 = lms[67] - lms[42];
+                auto d1 = norm(subbed1[0], subbed1[1]);
+                auto subbed2 = lms[67] - lms[45];
+                auto d2 = norm(subbed2[0], subbed2[1]);
+
+                auto d = d1 + d2;
+                pt[] = (points3d[42] * d1 + points3d[45] * d2) / d;
+            }
+
+            if (i < 2) {
+                auto reference = mtimes(rmatSlice, pt);
+                reference[] += translationSlice;
+                reference[] = mtimes(camera, reference);
+
+                auto depth = reference[2];
+                auto point3d = [lms[66 + i][0] * depth, lms[66 + i][1] * depth, depth].sliced;
+                point3d[] = mtimes(invCamera, point3d);
+                point3d[] -= translationSlice;
+                point3d[] = mtimes(invRmatSlice, point3d);
+                points3d[66 + i][] = point3d;
+            }
+        }
+
+        // done with everything above
     }
 
     void assignFaceInfo(ResultData[] results) {

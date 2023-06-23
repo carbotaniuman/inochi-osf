@@ -1,7 +1,10 @@
 module faceinfo;
 
+import inmath;
+
 import mir.ndslice;
 import tracker : ModelKind, ResultData, EyeState, Tracker;
+import face3d;
 
 struct Point {
     float x, y;
@@ -30,16 +33,24 @@ public:
         float conf = -1;
         Point coord = Point(float.nan, float.nan);
         Slice!(float*, 2, Contiguous) lms = slice!float(0, 0);
+        Slice!(float*, 2, Contiguous) face3d;
+        Slice!(float*, 2, Contiguous) contour;
         EyeState[] eyeState = [];
+
+        quat* rotation = null;
+        vec3* translation = null;
 
     this(Tracker tracker, ModelKind type) {
         this.tracker = tracker;
+        this.face3d = default_face3d.fuse.dup;
 
         if (type == ModelKind.T) {
             this.contourPoints = [0, 2, 8, 14, 16, 27, 30, 33].sliced!size_t;
         } else {
             this.contourPoints = [0, 1, 8, 15, 16, 27, 28, 29, 30, 31, 32, 33, 34, 35].sliced!size_t;
         }
+
+        this.contour = this.face3d[this.contourPoints].fuse;
     }
 
     void update(int frameCount) {
