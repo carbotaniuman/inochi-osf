@@ -21,7 +21,7 @@ void main()
     // auto axis = aa.toAxisAngle;
     // writeln(axis);
     // writeln(quat.axisRotation(axis.length, axis.normalized).normalized);
-
+    
     FaceData[] faces = [];
     Image image = imread("a.jpg");
 

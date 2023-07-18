@@ -25,7 +25,7 @@ import retinaface;
 import ortdata;
 
 import kaleidic.lubeck : inv, mtimes;
-import inmath : quat, vec3;
+import inmath : mat3, quat, vec3;
 
 import solvepnp : solvePnpIterative;
 
@@ -512,6 +512,7 @@ public:
                 24, 24, 28, 28, 28, 26, 29, 29, 29
             ];
 
+            // TODO: all of this
             throw new Exception("not yet implemented");
         }
 
@@ -568,7 +569,6 @@ public:
             auto cropX2 = face.x + face.width + to!int(face.width * 0.1);
             auto cropY2 = face.y + face.height + to!int(face.height * 0.125);
 
-            // TODO: clamp_to_im adds 1 to y values for some reason?
             cropX1 = clamp(cropX1, 0, this.width).trunc;
             cropY1 = clamp(cropY1, 0, this.height).trunc + 1;
             cropX2 = clamp(cropX2, 0, this.width).trunc;
@@ -652,7 +652,10 @@ public:
 
         foreach(faceInfo; this.faceInfos) {
             if (faceInfo.alive && faceInfo.conf > this.settings.threshold) {
-                this.estimateDepth(faceInfo);
+                auto res = this.estimateDepth(faceInfo);
+                faceInfo.pnpError = res.pnpError;
+                faceInfo.lms = res.lms;
+                faceInfo.adjust3d(res.points3d, this.settings.kind, this.settings.staticModel);
             }
         }
 
@@ -660,7 +663,17 @@ public:
         return [];
     }
 
-    void estimateDepth(FaceInfo info) {
+    struct EstimateResult {
+        float pnpError;
+        Slice!(float*, 2, Contiguous) points3d;
+        Slice!(float*, 2, Contiguous) lms;
+    }
+
+    Slice!(float*, 2, Contiguous) camera() {
+        return [[this.width, 0f, this.width / 2f], [0f, this.width, this.height / 2f], [0f, 0f, 1f]].fuse;
+    }
+
+    EstimateResult estimateDepth(FaceInfo info) {
         auto lms = concatenation(
             info.lms,
             [[info.eyeState[0].p.x, info.eyeState[0].p.y, info.eyeState[0].conf],
@@ -669,27 +682,24 @@ public:
 
         auto imagePts = lms[info.contourPoints, 0..2].slice;
 
-        auto camera = [[this.width, 0f, this.width / 2f], [0f, this.width, this.height / 2f], [0f, 0f, 1f]].fuse;
         auto invCamera = camera.inv;
     
         try {
-            if (info.rotation) {
+            if (info.rotation.isFinite) {
                 auto a = solvePnpIterative(info.contour, imagePts, camera, slice!float(0),
                     info.rotation.toAxisAngle.vector.sliced, info.translation.vector.sliced);
 
                 vec3 rot = vec3(a.rvec[0], a.rvec[1], a.rvec[2]);
-                info.rotation = new quat();
-                *info.rotation = quat.axisRotation(rot.length, rot.normalized);
-                info.translation = new vec3(a.tvec[0], a.tvec[1], a.tvec[2]);
+                info.rotation = quat.axisRotation(rot.length, rot.normalized);
+                info.translation = vec3(a.tvec[0], a.tvec[1], a.tvec[2]);
             } else {
                 auto rvec = [0f, 0f, 0f].sliced;
                 auto tvec = [0f, 0f, 0f].sliced;
                 auto a = solvePnpIterative(info.contour, imagePts, camera, slice!float(0), rvec, tvec);
 
                 vec3 rot = vec3(a.rvec[0], a.rvec[1], a.rvec[2]);
-                info.rotation = new quat();
-                *info.rotation = quat.axisRotation(rot.length, rot.normalized);
-                info.translation = new vec3(a.tvec[0], a.tvec[1], a.tvec[2]);
+                info.rotation = quat.axisRotation(rot.length, rot.normalized);
+                info.translation = vec3(a.tvec[0], a.tvec[1], a.tvec[2]);
             }
         } catch (Exception e) {
             // Do something here
@@ -734,13 +744,15 @@ public:
         {
             auto errorCalc = lms[0..17, 0..2].dup;
             errorCalc[] -= tRef[0..17, 0..2];
-            pnpError += errorCalc.map!"pow(a, 2)".sum;
+            auto s = errorCalc.flattened.map!"pow(a, 2)";
+            pnpError += s.sum;
         }
         
         {
             auto errorCalc = lms[30, 0..2].dup;
             errorCalc[] -= tRef[30, 0..2];
-            pnpError += errorCalc.map!"pow(a, 2)".sum;
+            auto s = errorCalc.flattened.map!"pow(a, 2)";
+            pnpError += s.sum;
         }
 
         if (pnpError.isNaN) {
@@ -804,7 +816,34 @@ public:
             }
         }
 
-        // done with everything above
+        foreach (i; points3d.byDim!0) {
+            if (any!(isNaN)(i)) {
+                i[] = [0.0, 0.0, 0.0];
+            }
+        }
+        
+        pnpError = sqrt(pnpError / (2.0 * imagePts.shape[0]));
+        
+        if (pnpError > 300.0) {
+            info.failureCount += 1;
+
+            if (info.failureCount > 5) {
+                writeln("warning: very high amounts of error");
+                info.resetFace3d();
+                info.rotation = quat(float.nan, float.nan, float.nan, float.nan);
+                info.translation = vec3(0.0, 0.0, 0.0);
+                info.updateCounts = slice!float([66, 2], 0);
+                info.updateContour();
+            }
+        } else {
+            info.failureCount = 0;
+        }
+
+        return EstimateResult(
+            pnpError,
+            points3d,
+            lms
+        );
     }
 
     void assignFaceInfo(ResultData[] results) {
@@ -828,7 +867,7 @@ public:
         auto candidates = new Tuple!(float, size_t, size_t)[][this.settings.maxFaces];
         foreach (i, faceInfo; this.faceInfos) {
             foreach (j, coord; resultCoords) {
-                if (faceInfo.coord == Point(float.nan, float.nan)) {
+                if (!faceInfo.coord.isFinite) {
                     candidates[i] ~= tuple(maxDist, i, j);
                 } else {
                     auto c = faceInfo.coord - coord;
@@ -925,7 +964,9 @@ public:
         auto rotated = rotateImage(frame, eye.angle, Point(eye.referenceX, eye.referenceY));
         auto sliced = rotated[eye.upperLeftYi..eye.lowerRightYi, eye.upperLeftXi..eye.lowerRightXi, 0..$];
 
-        // TODO: handle scenario with no eye/face
+        if (sliced.elementCount == 0) {
+            return EyeData.init;
+        }
 
         auto resized = flip ? sliced.reversed!1.resize([32, 32]) : sliced.resize([32, 32]);
 
@@ -1023,6 +1064,10 @@ public:
         auto right = this.prepareEye(faceFrame, frame, faceLms.indexed([36, 39]).fuse, false);
         auto left = this.prepareEye(faceFrame, frame, faceLms.indexed([42, 45]).fuse, true);
 
+        if (left.angle.isNaN || right.angle.isNaN) {
+            return [EyeState(true, Point(0.0, 0.0), 0.0), EyeState(true, Point(0.0, 0.0), 0.0)];
+        }
+
         auto eX = [right.upperLeftXi, left.upperLeftXi];
         auto eY = [right.upperLeftYi, left.upperLeftYi];
         auto scale = [[right.scaleX, right.scaleY], [left.scaleX, left.scaleY]];
@@ -1098,7 +1143,6 @@ public:
         auto centerX = (x1 + x2) / 2.0;
         auto centerY = (y1 + y2) / 2.0;
         
-        // TODO: clamp_to_im adds 1 to y values for some reason?
         int x1i = clamp(centerX - radiusX, 0, this.width).to!int;
         int y1i = clamp(centerY - radiusY, 0, this.height).to!int + 1;
         int x2i = clamp(centerX + radiusX + 1, 0, this.width).to!int;
@@ -1137,15 +1181,19 @@ auto compensate(float x1, float y1, float x2, float y2) {
     return tuple(rotate(Point(x1, y1), Point(x2, y2), a), a);
 }
 
+// Not sure if this is needed but better
+// safe than sorry
+float pymod(float x, float y) {
+	return ((x % y) + y) % y;
+}
+
 float angle(float x1, float y1, float x2, float y2) {
     float first = y2 - y1;
     float second = x2 - x1;
 
     auto angle = atan2(first, second);
 
-    // TODO: isn't this just atan?
-    // TODO: test behavior when angle is negative
-    return angle % (2 * PI);
+    return pymod(angle, (2 * PI));
 }
 
 Point rotate(Point o, Point p, float a) {
